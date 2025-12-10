@@ -48,7 +48,7 @@ class AppConfig:
     BEDROCK_REGION: str = os.getenv("BEDROCK_REGION", "us-east-1")
     BEDROCK_MODEL_ID: str = os.getenv(
         "BEDROCK_MODEL_ID",
-        "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+        "your model choice"
     )
     READ_TIMEOUT: int = int(os.getenv("READ_TIMEOUT", "120"))
     CONNECT_TIMEOUT: int = int(os.getenv("CONNECT_TIMEOUT", "15"))
@@ -877,4 +877,5 @@ def download_docx(rid: str):
 
 
 if __name__ == "__main__":
+
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)

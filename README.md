@@ -49,9 +49,9 @@ A Flask-based application that extracts control information from SOC 2 PDF repor
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-## Installation
+**Installation**
 
-### Prerequisites
+**Prerequisites**
 Python 3.8+
 AWS credentials configured with Bedrock access
 

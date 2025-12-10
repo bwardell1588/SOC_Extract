@@ -1,0 +1,15 @@
+# Web & server
+Flask==3.0.0
+
+# AWS Bedrock client
+boto3>=1.34.0
+botocore>=1.34.0
+
+# PDF parsing
+pdfminer.six>=20220524
+
+# PDF generation (report)
+reportlab>=4.0.0
+
+# Optional configuration
+python-dotenv>=1.0.0

@@ -48,7 +48,7 @@ class AppConfig:
     BEDROCK_REGION: str = os.getenv("BEDROCK_REGION", "us-east-1")
     BEDROCK_MODEL_ID: str = os.getenv(
         "BEDROCK_MODEL_ID",
-        "your model choice"
+        "global.anthropic.claude-haiku-4-5-20251001-v1:0"
     )
     READ_TIMEOUT: int = int(os.getenv("READ_TIMEOUT", "120"))
     CONNECT_TIMEOUT: int = int(os.getenv("CONNECT_TIMEOUT", "15"))
@@ -158,17 +158,27 @@ def _maybe_truncate(s: str) -> str:
     return s
 
 
-def invoke_bedrock(system_text: str, instruction_text: str) -> Dict[str, Any]:
+def invoke_bedrock(system_text: str, instruction_text: str, use_cache: bool = True) -> Dict[str, Any]:
     client = _new_bedrock_client()
+    
+    # Build system content - with or without cache_control
+    if use_cache:
+        system_content = [{
+            "type": "text",
+            "text": system_text,
+            "cache_control": {"type": "ephemeral"}
+        }]
+    else:
+        system_content = [{
+            "type": "text",
+            "text": system_text
+        }]
+    
     request_body = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": app.config["MAX_TOTAL_TOKENS"],
         "temperature": app.config["TEMPERATURE"],
-        "system": [{
-            "type": "text",
-            "text": system_text,
-            "cache_control": {"type": "ephemeral"}
-        }],
+        "system": system_content,
         "messages": [{"role": "user", "content": [{"type": "text", "text": instruction_text}]}]
     }
 
@@ -199,11 +209,11 @@ def invoke_bedrock(system_text: str, instruction_text: str) -> Dict[str, Any]:
     return _parse_model_json(model_text)
 
 
-def invoke_bedrock_with_retry(system_text: str, instruction_text: str) -> Dict[str, Any]:
+def invoke_bedrock_with_retry(system_text: str, instruction_text: str, use_cache: bool = True) -> Dict[str, Any]:
     last_err = None
     for attempt in range(app.config["MAX_RETRIES"]):
         try:
-            return invoke_bedrock(system_text, instruction_text)
+            return invoke_bedrock(system_text, instruction_text, use_cache=use_cache)
         except (ReadTimeoutError, EndpointConnectionError, BotoCoreError, RuntimeError, JSONDecodeError) as e:
             last_err = e
             logger.warning("Bedrock attempt %d failed: %s", attempt + 1, e)
@@ -233,82 +243,311 @@ def extract_pdf_text(file_bytes: bytes) -> Tuple[str, List[str]]:
     return full_text, pages
 
 
-def is_table_page(page_text: str) -> bool:
+def detect_section_markers(pages: List[str]) -> Dict[int, int]:
     """
-    Aggressively detect pages likely containing tables.
-    Uses multiple heuristics to catch controls, exceptions, criteria tables, etc.
+    Detect SOC report section boundaries.
+    Returns a dict mapping page indices to section numbers.
+    
+    Section detection logic:
+    - Looks for "SECTION I", "SECTION II", "SECTION III", etc. patterns
+    - Handles multiple formats:
+      - "SECTION III" standalone on its own line
+      - "SECTION III - Title" with dash separator
+      - "SECTION 3" numeric formats
+      - "SECTION THREE" spelled-out numbers
+      - "SECTION - THREE" with dash before number
+      - "III." standalone Roman numeral with period
+    - Forward-fills section numbers to subsequent pages
+    - Ignores section references in Table of Contents
     """
+    section_info: Dict[int, int] = {}
+    current_section = 0
+    
+    # Roman numeral mapping
+    roman_to_int = {
+        'I': 1, 'II': 2, 'III': 3, 'IV': 4, 'V': 5, 
+        'VI': 6, 'VII': 7, 'VIII': 8, 'IX': 9, 'X': 10
+    }
+    
+    # Spelled-out number mapping
+    word_to_int = {
+        'ONE': 1, 'TWO': 2, 'THREE': 3, 'FOUR': 4, 'FIVE': 5,
+        'SIX': 6, 'SEVEN': 7, 'EIGHT': 8, 'NINE': 9, 'TEN': 10
+    }
+    
+    def parse_section_number(section_str):
+        """Convert section string (roman, arabic, or word) to integer."""
+        section_str = section_str.upper().strip()
+        if section_str in roman_to_int:
+            return roman_to_int[section_str]
+        if section_str in word_to_int:
+            return word_to_int[section_str]
+        if section_str.isdigit():
+            return int(section_str)
+        return 0
+    
+    # Combined pattern for section numbers: roman numerals, digits, or spelled-out words
+    section_num_pattern = r'([IVX]+|[0-9]+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN)'
+    
+    for i, page in enumerate(pages):
+        detected_section = 0
+        
+        # Skip Table of Contents pages - they mention all sections but aren't the actual sections
+        if 'Table of Contents' in page[:500] or 'TABLE OF CONTENTS' in page[:500]:
+            section_info[i] = current_section
+            continue
+        
+        # Pattern 1: "SECTION III" or "SECTION THREE" on its own line (standalone header)
+        standalone_pattern = re.compile(
+            r'^\s*SECTION\s+' + section_num_pattern + r'\s*$', 
+            re.MULTILINE | re.IGNORECASE
+        )
+        match = standalone_pattern.search(page)
+        if match:
+            detected_section = parse_section_number(match.group(1))
+        
+        # Pattern 2: "SECTION III - Title" or "SECTION THREE - Title" format (with dash and title)
+        if not detected_section:
+            dash_after_pattern = re.compile(
+                r'^\s*SECTION\s+' + section_num_pattern + r'\s*[-–—]\s*\S', 
+                re.MULTILINE | re.IGNORECASE
+            )
+            match = dash_after_pattern.search(page)
+            if match:
+                detected_section = parse_section_number(match.group(1))
+        
+        # Pattern 3: "SECTION - THREE" or "SECTION - III" format (with dash before number)
+        if not detected_section:
+            dash_before_pattern = re.compile(
+                r'^\s*SECTION\s*[-–—]\s*' + section_num_pattern + r'(?:\s|$|[-–—])', 
+                re.MULTILINE | re.IGNORECASE
+            )
+            match = dash_before_pattern.search(page)
+            if match:
+                detected_section = parse_section_number(match.group(1))
+        
+        # Pattern 4: "SECTION III" or "SECTION THREE" followed by newline (in running text)
+        if not detected_section:
+            inline_pattern = re.compile(
+                r'SECTION\s+' + section_num_pattern + r'\s*[\n\r]', 
+                re.IGNORECASE
+            )
+            match = inline_pattern.search(page)
+            if match:
+                detected_section = parse_section_number(match.group(1))
+        
+        # Pattern 5: Standalone "III." or "IV." (Roman numeral with period, no "SECTION" word)
+        # Must be at start of line to avoid matching list items
+        if not detected_section:
+            roman_standalone_pattern = re.compile(
+                r'^\s*([IVX]+)\.\s*$',
+                re.MULTILINE
+            )
+            match = roman_standalone_pattern.search(page)
+            if match:
+                detected_section = parse_section_number(match.group(1))
+        
+        # Pattern 6: "III. Title" or "IV. Title" (Roman numeral with period followed by title)
+        if not detected_section:
+            roman_title_pattern = re.compile(
+                r'^\s*([IVX]+)\.\s+[A-Z]',
+                re.MULTILINE
+            )
+            match = roman_title_pattern.search(page)
+            if match:
+                # Only match if it looks like a section header (near top of page or after whitespace)
+                match_pos = match.start()
+                # Check if this is near the beginning of meaningful content
+                preceding_text = page[:match_pos].strip()
+                # Accept if it's near the top or after minimal content (like headers/footers)
+                if len(preceding_text) < 200:
+                    detected_section = parse_section_number(match.group(1))
+        
+        # Update current section if we found a new one
+        if detected_section > 0:
+            current_section = detected_section
+        
+        section_info[i] = current_section
+    
+    return section_info
+
+
+def analyze_text_structure(page_text: str) -> Dict[str, Any]:
+    """
+    Analyze structural characteristics of page text.
+    Used as fallback scoring when section markers aren't available.
+    """
+    lines = [ln for ln in page_text.split("\n") if ln.strip()]
     text_lower = page_text.lower()
     
-    # Strong indicators - if any present, likely a table page
-    strong_indicators = [
-        r"no exceptions? noted",
-        r"results of testing",
-        r"testing performed",
-        r"controls? specified",
-        r"\bref\b.*\bcontrols?\b",
-        r"section iv",
-        r"section v",
-        r"common criteria",
-        r"control activities",
-        r"trust services criteria",
+    analysis: Dict[str, Any] = {
+        'line_count': len(lines),
+        'indicators': [],
+        'score_adjustments': 0
+    }
+    
+    # Test result language density (strong indicator of control testing tables)
+    result_phrases = [
+        "no exceptions noted",
+        "inquired of",
+        "inspected the",
+        "determined that",
+        "observed that"
     ]
+    result_density = sum(text_lower.count(phrase) for phrase in result_phrases)
+    if result_density >= 3:
+        analysis['score_adjustments'] += 2
+        analysis['indicators'].append(f"test result density: {result_density}")
     
-    for pattern in strong_indicators:
-        if re.search(pattern, text_lower):
-            return True
+    # CC criteria references (e.g., CC1.1, CC6.2)
+    criteria_pattern = re.compile(r'\bCC\s*\d+\.\d+\b', re.IGNORECASE)
+    criteria_matches = criteria_pattern.findall(page_text)
+    if len(criteria_matches) >= 2:
+        analysis['score_adjustments'] += 1
+        analysis['indicators'].append(f"CC criteria: {len(criteria_matches)}")
     
-    # Structural indicators - multiple short lines with consistent patterns suggest tables
-    lines = [ln.strip() for ln in page_text.split("\n") if ln.strip()]
+    # Table continuation markers
+    if "(continued)" in text_lower:
+        analysis['score_adjustments'] += 1
+        analysis['indicators'].append("continued marker")
     
-    # Check for control reference patterns (e.g., 1.1, 2.3, CC6.1)
-    ref_pattern = re.compile(r"^(?:CC)?\d+\.\d+\b")
-    ref_lines = sum(1 for ln in lines if ref_pattern.match(ln))
-    if ref_lines >= 3:
-        return True
+    # Multi-column layout detection
+    multi_column_lines = 0
+    for line in lines:
+        chunks = re.split(r'\s{3,}', line.strip())
+        chunks = [c for c in chunks if c.strip()]
+        if len(chunks) >= 2:
+            multi_column_lines += 1
     
+    if lines and multi_column_lines / len(lines) > 0.3:
+        analysis['score_adjustments'] += 1
+        analysis['indicators'].append(f"multi-column lines: {multi_column_lines}")
+    
+    return analysis
 
+
+def is_table_page(page_text: str, page_idx: int, section_info: Dict[int, int]) -> Dict[str, Any]:
+    """
+    Determine if a page should be classified as table content.
     
-    # Check for repeated testing/inspection language
-    test_words = ["inspected", "inquired", "determined", "observed", "reviewed", "verified"]
-    test_count = sum(1 for word in test_words if word in text_lower)
-    if test_count >= 3:
-        return True
+    Primary logic (section-based):
+    - Sections I-II (auditor opinion, management assertion) -> NARRATIVE
+    - Section 0 (before any section marker, e.g., cover, TOC) -> NARRATIVE
+    - Sections III+ (system description, controls, testing) -> TABLE
     
-    return False
+    Fallback logic (when section not detected but after Section III has started):
+    - Use structural analysis
+    """
+    reasons: List[str] = []
+    score = 0
+    
+    section_num = section_info.get(page_idx, 0)
+    
+    # ===========================================
+    # PRIMARY RULE: Section-based classification
+    # ===========================================
+    
+    # Section 0, I, and II are ALWAYS narrative
+    # Section 0 = pages before any section marker (cover page, TOC, etc.)
+    if section_num in [0, 1, 2]:
+        if section_num == 0:
+            reasons.append("Before Section III (cover/TOC -> narrative)")
+        else:
+            reasons.append(f"Section {section_num} (auditor/management -> narrative)")
+        return {
+            "is_table": False,
+            "score": -10,
+            "reasons": reasons,
+            "forced_narrative": True,
+            "forced_table": False
+        }
+    
+    # Sections III+ are ALWAYS table content
+    if section_num >= 3:
+        reasons.append(f"Section {section_num} (system/controls/testing -> table)")
+        return {
+            "is_table": True,
+            "score": 10,
+            "reasons": reasons,
+            "forced_narrative": False,
+            "forced_table": True
+        }
+    
+    # ===========================================
+    # FALLBACK: Should rarely reach here
+    # Use structural analysis
+    # ===========================================
+    reasons.append("Unknown section - using structural analysis")
+    
+    # Text structure analysis
+    text_analysis = analyze_text_structure(page_text)
+    score += text_analysis['score_adjustments']
+    reasons.extend(text_analysis['indicators'])
+    
+    # Threshold for table classification
+    is_table_result = score >= 2
+    
+    return {
+        "is_table": is_table_result,
+        "score": score,
+        "reasons": reasons,
+        "forced_narrative": False,
+        "forced_table": False
+    }
 
 
-def segment_content(pages: List[str]) -> Dict[str, str]:
-    """Separate table content from narrative content."""
+def segment_content(pages: List[str]) -> Dict[str, Any]:
+    """
+    Separate table content from narrative content using section-based detection.
     
-    # First pass: classify each page
-    is_table = [is_table_page(page) for page in pages]
+    Classification rules:
+    - Sections I-II (auditor opinion, management assertion) -> NARRATIVE
+    - Sections III+ (system description, controls, testing) -> TABLE
+    """
     
-    # Second pass: include the page before any table page
-    for i in range(1, len(is_table)):
-        if is_table[i] and not is_table[i-1]:
-            is_table[i-1] = True
+    # Detect section boundaries
+    section_info = detect_section_markers(pages)
+    
+    page_classifications: List[Dict[str, Any]] = []
+
+    # Classify each page based on section
+    for i, page in enumerate(pages):
+        analysis = is_table_page(page, i, section_info)
+        page_classifications.append({
+            "page": i + 1,
+            "is_table": analysis["is_table"],
+            "section": section_info.get(i, 0),
+            "forced_narrative": analysis.get("forced_narrative", False),
+            "forced_table": analysis.get("forced_table", False),
+            "reasons": analysis["reasons"],
+        })
     
     # Build the text segments
-    table_parts = []
-    narrative_parts = []
+    table_parts: List[str] = []
+    narrative_parts: List[str] = []
 
-    for i, page in enumerate(pages):
-        labeled = f"=== PAGE {i+1} ===\n{page}"
-        if is_table[i]:
+    for i, classification in enumerate(page_classifications):
+        labeled = f"=== PAGE {classification['page']} ===\n{pages[i]}"
+        if classification["is_table"]:
             table_parts.append(labeled)
         else:
             narrative_parts.append(labeled)
 
     table_text = "\n\n".join(table_parts)
     narrative_text = "\n\n".join(narrative_parts)
+    
+    # Find where Section III starts for logging
+    sec3_start = next((c['page'] for c in page_classifications if c['section'] >= 3), None)
 
-    logger.info("[Segment] %d table pages, %d narrative pages", len(table_parts), len(narrative_parts))
+    logger.info("[Segment] Section-based: %d table pages (Section III+), %d narrative pages (Sections 0-II). Section III starts at page %s", 
+                len(table_parts), len(narrative_parts), sec3_start)
 
     return {
         "table_text": table_text,
         "narrative_text": narrative_text,
+        "classifications": page_classifications,
     }
+
 
 
 # -----------------------------
@@ -349,6 +588,9 @@ def merge_criteria_into_controls(
     """
     Merge criteria mappings into controls.
     Creates a reverse lookup: control_id -> list of criteria that reference it.
+    
+    IMPORTANT: Preserves any criteria already extracted with the control,
+    only adds new criteria from the mapping that aren't already present.
     """
     # Build reverse mapping: control_id -> [criterion_ids]
     control_to_criteria: Dict[str, List[str]] = {}
@@ -368,23 +610,46 @@ def merge_criteria_into_controls(
     
     logger.info("[Merge] Built reverse mapping for %d control references", len(control_to_criteria))
     
-    # Apply criteria to each control
+    # Track stats
+    controls_with_existing_criteria = 0
+    controls_with_added_criteria = 0
+    
+    # Apply criteria to each control (merge, don't replace)
     for control in controls:
         control_id = (control.get("control_id") or "").strip()
         
-        # Try to find matching criteria
-        matched_criteria = control_to_criteria.get(control_id, [])
+        # Get existing criteria from control extraction (may be empty list)
+        existing_criteria = control.get("criterion") or []
+        if isinstance(existing_criteria, str):
+            existing_criteria = [existing_criteria] if existing_criteria else []
+        existing_criteria = [c.strip() for c in existing_criteria if c.strip()]
         
-        # Also try without leading zeros or with different formats
-        if not matched_criteria:
-            # Try numeric variations (e.g., "1.1" vs "1.01")
+        if existing_criteria:
+            controls_with_existing_criteria += 1
+        
+        # Find additional criteria from mapping tables
+        mapped_criteria = control_to_criteria.get(control_id, [])
+        
+        # Also try normalized matching if no exact match
+        if not mapped_criteria:
             for ref in control_to_criteria:
                 if _normalize_control_ref(ref) == _normalize_control_ref(control_id):
-                    matched_criteria = control_to_criteria[ref]
+                    mapped_criteria = control_to_criteria[ref]
                     break
         
-        # Sort criteria for consistent output
-        control["criterion"] = sorted(matched_criteria) if matched_criteria else []
+        # Merge: start with existing, add any from mapping that aren't already present
+        existing_set = set(existing_criteria)
+        new_criteria = [c for c in mapped_criteria if c not in existing_set]
+        
+        if new_criteria:
+            controls_with_added_criteria += 1
+        
+        # Combined and sorted
+        all_criteria = existing_criteria + new_criteria
+        control["criterion"] = sorted(set(all_criteria)) if all_criteria else []
+    
+    logger.info("[Merge] %d controls had criteria from extraction, %d had criteria added from mapping",
+                controls_with_existing_criteria, controls_with_added_criteria)
     
     return controls
 
@@ -414,17 +679,37 @@ def _apply_table_font(table, font_size_pt: int = 8) -> None:
                     run.font.size = Pt(font_size_pt)
 
 
-def build_controls_docx(
-    vendor_controls: List[Dict[str, Any]],
+def _set_cell_border(cell, border_type: str = "none"):
+    """Set cell borders. Use 'none' to hide borders."""
+    from docx.oxml.ns import nsdecls
+    from docx.oxml import parse_xml
+    
+    if border_type == "none":
+        tc = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        tcBorders = parse_xml(
+            r'<w:tcBorders xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            r'<w:top w:val="nil"/><w:left w:val="nil"/><w:bottom w:val="nil"/><w:right w:val="nil"/>'
+            r'</w:tcBorders>'
+        )
+        tcPr.append(tcBorders)
+
+
+def build_report_docx(
+    auditor_opinion: Dict[str, Any],
     subservice_controls: List[Dict[str, Any]],
     user_entity_controls: List[Dict[str, Any]],
+    vendor_controls: List[Dict[str, Any]],
+    exceptions: List[Dict[str, Any]],
+    criteria_mappings: List[Dict[str, Any]],
     out_path: str
 ) -> None:
     if Document is None:
         raise RuntimeError("python-docx required: pip install python-docx")
 
-    logger.info("[Report] Building DOCX: %s (vendor=%d, subservice=%d, user_entity=%d)", 
-                out_path, len(vendor_controls or []), len(subservice_controls or []), len(user_entity_controls or []))
+    logger.info("[Report] Building DOCX: %s (vendor=%d, subservice=%d, user_entity=%d, exceptions=%d, criteria=%d)", 
+                out_path, len(vendor_controls or []), len(subservice_controls or []), 
+                len(user_entity_controls or []), len(exceptions or []), len(criteria_mappings or []))
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
     doc = Document()
@@ -436,15 +721,156 @@ def build_controls_docx(
     section.top_margin = section.bottom_margin = Inches(0.5)
     section.left_margin = section.right_margin = Inches(0.5)
 
-    doc.add_heading("SOC 2 Control Extraction", 0)
+    doc.add_heading("SOC 2 Report Extraction", 0)
 
     # ===========================================
-    # Table 1: Vendor/Service Organization Controls
+    # Section 1: General Info Table (no borders)
     # ===========================================
+    doc.add_heading("General Information", level=1)
+
+    info_table = doc.add_table(rows=6, cols=2)
+    
+    # Row 0: Service/Product
+    info_table.rows[0].cells[0].text = "Service/Product:"
+    info_table.rows[0].cells[1].text = auditor_opinion.get("service_product") or ""
+    
+    # Row 1: Report Type
+    info_table.rows[1].cells[0].text = "Report Type:"
+    info_table.rows[1].cells[1].text = auditor_opinion.get("report_type") or ""
+    
+    # Row 2: Scope Date
+    info_table.rows[2].cells[0].text = "Scope Date:"
+    info_table.rows[2].cells[1].text = auditor_opinion.get("scope_date") or ""
+    
+    # Row 3: Auditor's Name
+    info_table.rows[3].cells[0].text = "Auditor's Name:"
+    info_table.rows[3].cells[1].text = auditor_opinion.get("auditors_name") or ""
+    
+    # Row 4: Qualified Opinion
+    info_table.rows[4].cells[0].text = "Qualified Opinion:"
+    qualified = auditor_opinion.get("qualified_opinion")
+    info_table.rows[4].cells[1].text = "Yes" if qualified else "No" if qualified is False else ""
+    
+    # Row 5: Auditor's Opinion
+    info_table.rows[5].cells[0].text = "Auditor's Opinion:"
+    info_table.rows[5].cells[1].text = auditor_opinion.get("auditors_opinion") or ""
+    
+    # Remove borders from info table
+    for row in info_table.rows:
+        for cell in row.cells:
+            _set_cell_border(cell, "none")
+    
+    # Set column widths
+    for row in info_table.rows:
+        row.cells[0].width = Inches(1.5)
+        row.cells[1].width = Inches(8.5)
+    
+    _apply_table_font(info_table, font_size_pt=10)
+
+    # ===========================================
+    # Section 2: Criteria Mappings
+    # ===========================================
+    doc.add_paragraph()
+    doc.add_heading("Criteria Mappings", level=1)
+
+    crit_headers = ["Criterion ID", "Description", "Mapped Controls"]
+    crit_col_widths = [Inches(1.2), Inches(5.0), Inches(3.8)]
+
+    crit_table = doc.add_table(rows=1, cols=len(crit_headers))
+    crit_hdr = crit_table.rows[0].cells
+    for i, h in enumerate(crit_headers):
+        crit_hdr[i].text = h
+        crit_hdr[i].width = crit_col_widths[i]
+
+    if criteria_mappings:
+        for mapping in criteria_mappings:
+            row = crit_table.add_row().cells
+            row[0].text = mapping.get("criterion_id") or ""
+            row[1].text = mapping.get("criterion_description") or ""
+            mapped = mapping.get("mapped_controls") or []
+            row[2].text = ", ".join(mapped) if isinstance(mapped, list) else str(mapped)
+            for i, cell in enumerate(row):
+                cell.width = crit_col_widths[i]
+    else:
+        row = crit_table.add_row().cells
+        row[0].text = "No criteria mappings found"
+
+    _apply_table_font(crit_table)
+
+    # ===========================================
+    # Section 3: Complementary Subservice Organization Controls
+    # ===========================================
+    doc.add_paragraph()
+    doc.add_heading("Complementary Subservice Organization Controls", level=1)
+
+    sub_headers = ["Organization", "Control ID", "Description", "Criteria Covered"]
+    sub_col_widths = [Inches(1.5), Inches(0.8), Inches(5.0), Inches(2.5)]
+
+    sub_table = doc.add_table(rows=1, cols=len(sub_headers))
+    sub_hdr = sub_table.rows[0].cells
+    for i, h in enumerate(sub_headers):
+        sub_hdr[i].text = h
+        sub_hdr[i].width = sub_col_widths[i]
+
+    has_subservice_rows = False
+    for c in subservice_controls or []:
+        has_subservice_rows = True
+        row = sub_table.add_row().cells
+        row[0].text = c.get("organization_name") or c.get("name") or ""
+        row[1].text = c.get("control_id") or ""
+        row[2].text = c.get("description") or ""
+        criteria = c.get("criteria_covered") or []
+        row[3].text = ", ".join(criteria) if isinstance(criteria, list) else str(criteria)
+        for i, cell in enumerate(row):
+            cell.width = sub_col_widths[i]
+
+    if not has_subservice_rows:
+        row = sub_table.add_row().cells
+        row[0].text = "No subservice organization controls found"
+
+    _apply_table_font(sub_table)
+
+    # ===========================================
+    # Section 4: Complementary User Entity Controls
+    # ===========================================
+    doc.add_paragraph()
+    doc.add_heading("Complementary User Entity Controls", level=1)
+
+    ue_headers = ["Category", "Control ID", "Description", "Criteria Covered"]
+    ue_col_widths = [Inches(1.5), Inches(0.8), Inches(5.0), Inches(2.5)]
+
+    ue_table = doc.add_table(rows=1, cols=len(ue_headers))
+    ue_hdr = ue_table.rows[0].cells
+    for i, h in enumerate(ue_headers):
+        ue_hdr[i].text = h
+        ue_hdr[i].width = ue_col_widths[i]
+
+    has_user_entity_rows = False
+    for c in user_entity_controls or []:
+        has_user_entity_rows = True
+        row = ue_table.add_row().cells
+        row[0].text = c.get("category") or c.get("name") or ""
+        row[1].text = c.get("control_id") or ""
+        row[2].text = c.get("description") or ""
+        criteria = c.get("criteria_covered") or []
+        row[3].text = ", ".join(criteria) if isinstance(criteria, list) else str(criteria)
+        for i, cell in enumerate(row):
+            cell.width = ue_col_widths[i]
+
+    if not has_user_entity_rows:
+        row = ue_table.add_row().cells
+        row[0].text = "No user entity controls found"
+
+    _apply_table_font(ue_table)
+
+    # ===========================================
+    # Section 5: Vendor/Service Organization Controls
+    # ===========================================
+    doc.add_paragraph()
     doc.add_heading("Vendor/Service Organization Controls", level=1)
 
     headers = ["Control ID", "Criterion", "Title", "Description", "Tests Applied", "Result"]
-    col_widths = [Inches(1.0), Inches(1.0), Inches(2.0), Inches(2.8), Inches(3.0), Inches(0.5)]
+    col_widths = [Inches(0.8), Inches(1.2), Inches(1.8), Inches(2.8), Inches(2.8), Inches(0.8)]
 
     table = doc.add_table(rows=1, cols=len(headers))
     hdr = table.rows[0].cells
@@ -471,64 +897,34 @@ def build_controls_docx(
     _apply_table_font(table)
 
     # ===========================================
-    # Table 2: Complementary Subservice Organization Controls
+    # Section 5: Exceptions
     # ===========================================
-    doc.add_paragraph()  # spacing
-    doc.add_heading("Complementary Subservice Organization Controls", level=1)
+    doc.add_paragraph()
+    doc.add_heading("Exceptions", level=1)
 
-    sub_headers = ["Name", "Description", "Criteria Covered"]
-    sub_col_widths = [Inches(2.0), Inches(5.0), Inches(3.0)]
+    exc_headers = ["Control Objective", "Testing Description", "Exception Description", "Management Response"]
+    exc_col_widths = [Inches(1.5), Inches(2.5), Inches(3.0), Inches(3.0)]
 
-    sub_table = doc.add_table(rows=1, cols=len(sub_headers))
-    sub_hdr = sub_table.rows[0].cells
-    for i, h in enumerate(sub_headers):
-        sub_hdr[i].text = h
-        sub_hdr[i].width = sub_col_widths[i]
+    exc_table = doc.add_table(rows=1, cols=len(exc_headers))
+    exc_hdr = exc_table.rows[0].cells
+    for i, h in enumerate(exc_headers):
+        exc_hdr[i].text = h
+        exc_hdr[i].width = exc_col_widths[i]
 
-    for c in subservice_controls or []:
-        row = sub_table.add_row().cells
-        row[0].text = c.get("name") or ""
-        row[1].text = c.get("description") or ""
-        criteria = c.get("criteria_covered") or []
-        row[2].text = ", ".join(criteria) if isinstance(criteria, list) else str(criteria)
-        for i, cell in enumerate(row):
-            cell.width = sub_col_widths[i]
+    if exceptions:
+        for e in exceptions:
+            row = exc_table.add_row().cells
+            row[0].text = e.get("control_objective") or ""
+            row[1].text = e.get("testing_description") or ""
+            row[2].text = e.get("exception_description") or ""
+            row[3].text = e.get("management_response") or ""
+            for i, cell in enumerate(row):
+                cell.width = exc_col_widths[i]
+    else:
+        row = exc_table.add_row().cells
+        row[0].text = "No exceptions found"
 
-    if not subservice_controls:
-        row = sub_table.add_row().cells
-        row[0].text = "No subservice organization controls found"
-
-    _apply_table_font(sub_table)
-
-    # ===========================================
-    # Table 3: Complementary User Entity Controls
-    # ===========================================
-    doc.add_paragraph()  # spacing
-    doc.add_heading("Complementary User Entity Controls", level=1)
-
-    ue_headers = ["Name", "Description", "Criteria Covered"]
-    ue_col_widths = [Inches(2.0), Inches(5.0), Inches(3.0)]
-
-    ue_table = doc.add_table(rows=1, cols=len(ue_headers))
-    ue_hdr = ue_table.rows[0].cells
-    for i, h in enumerate(ue_headers):
-        ue_hdr[i].text = h
-        ue_hdr[i].width = ue_col_widths[i]
-
-    for c in user_entity_controls or []:
-        row = ue_table.add_row().cells
-        row[0].text = c.get("name") or ""
-        row[1].text = c.get("description") or ""
-        criteria = c.get("criteria_covered") or []
-        row[2].text = ", ".join(criteria) if isinstance(criteria, list) else str(criteria)
-        for i, cell in enumerate(row):
-            cell.width = ue_col_widths[i]
-
-    if not user_entity_controls:
-        row = ue_table.add_row().cells
-        row[0].text = "No user entity controls found"
-
-    _apply_table_font(ue_table)
+    _apply_table_font(exc_table)
 
     doc.save(out_path)
     logger.info("[Report] Wrote: %s (%d bytes)", out_path, os.path.getsize(out_path))
@@ -674,10 +1070,14 @@ def index():
 # -----------------------------
 
 from prompts import (
-    SYSTEM_CONTROLS, INSTRUCTION_CONTROLS,
-    SYSTEM_CRITERIA, INSTRUCTION_CRITERIA,
-    SYSTEM_SUBSERVICE, INSTRUCTION_SUBSERVICE,
-    SYSTEM_USER_ENTITY, INSTRUCTION_USER_ENTITY,
+    SYSTEM_DOCUMENT_TABLES,
+    SYSTEM_DOCUMENT_GENERAL,
+    INSTRUCTION_CONTROLS,
+    INSTRUCTION_SUBSERVICE,
+    INSTRUCTION_USER_ENTITY,
+    INSTRUCTION_CRITERIA,
+    INSTRUCTION_EXCEPTIONS,
+    INSTRUCTION_AUDITOR_OPINION,
 )
 
 
@@ -706,6 +1106,7 @@ def parse_pdf():
         "full_text": full_text,
         "table_text": segments["table_text"],
         "narrative_text": segments["narrative_text"],
+        "pages": pages,  # Store individual pages for partial extraction
     }
 
     # Log stats
@@ -730,31 +1131,58 @@ def parse_pdf():
 @app.post("/extract_cursor/<doc_id>")
 def extract_controls_cursor(doc_id: str):
     """
-    Multi-phase extraction:
-    1. Extract vendor/service organization controls (batched, cursor-based)
-    2. Extract subservice organization controls (single call)
-    3. Extract user entity controls (single call)
-    4. Extract criteria mappings (single call)
-    5. Merge criteria into vendor controls
-    6. Generate DOCX with all control types
+    Multi-phase extraction with shared system prompts for cache reuse:
+    1. Extract auditor's opinion (from first 25 pages, no caching)
+    2. Extract vendor/service organization controls (batched, cursor-based, cached)
+    3. Extract exceptions (single call, cached)
+    4. Extract subservice organization controls (single call, cached)
+    5. Extract user entity controls (single call, cached)
+    6. Extract criteria mappings (single call, cached)
+    7. Merge criteria into vendor controls
+    8. Generate DOCX with all content
     """
     if doc_id not in PARSED_CACHE:
         return jsonify({"ok": False, "error": "Unknown doc_id"}), 404
 
     cache = PARSED_CACHE[doc_id]
 
-    # Use table_text if available, fallback to full_text
-    doc_text = cache["table_text"] if cache["table_text"].strip() else cache["full_text"]
-    logger.info("[Extract] Using %s (%d chars)", 
-                "table_text" if cache["table_text"].strip() else "full_text (fallback)", 
-                len(doc_text))
+    # Get text segments
+    pages = cache.get("pages", [])
+    table_text = cache["table_text"] if cache["table_text"].strip() else cache["full_text"]
+    
+    # Build first 25 pages text for auditor opinion (no caching needed)
+    first_pages = pages[:25]
+    first_pages_text = "\n".join([f"=== PAGE {i+1} ===\n{p}" for i, p in enumerate(first_pages)])
+    
+    logger.info("[Extract] Using first %d pages (%d chars) for auditor opinion, table_text (%d chars) for controls", 
+                len(first_pages), len(first_pages_text), len(table_text))
 
     t0 = time.time()
 
+    # System prompt for tables (cached for multiple calls)
+    system_prompt_tables = SYSTEM_DOCUMENT_TABLES.replace("{{DOCUMENT_TEXT}}", table_text)
+    
+    # System prompt for auditor opinion (first 25 pages, not cached)
+    system_prompt_opinion = SYSTEM_DOCUMENT_GENERAL.replace("{{DOCUMENT_TEXT}}", first_pages_text)
+
     # ===========================================
-    # Phase 1: Extract vendor controls (batched)
+    # Phase 1: Extract auditor's opinion (first 25 pages, no cache)
     # ===========================================
-    system_prompt_controls = SYSTEM_CONTROLS.replace("{{DOCUMENT_TEXT}}", doc_text)
+    logger.info("[Extract Auditor Opinion] Starting (first 25 pages, no cache)...")
+    
+    try:
+        opinion_result = invoke_bedrock_with_retry(system_prompt_opinion, INSTRUCTION_AUDITOR_OPINION, use_cache=False)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Bedrock error (auditor opinion): {e}"}), 500
+
+    auditor_opinion = opinion_result.get("auditor_opinion", {})
+    logger.info("[Extract Auditor Opinion] Complete: report_type=%s, qualified=%s", 
+                auditor_opinion.get("report_type", "unknown"),
+                auditor_opinion.get("qualified_opinion", "unknown"))
+
+    # ===========================================
+    # Phase 2: Extract vendor controls (batched, from tables)
+    # ===========================================
     batch_size = app.config["BATCH_SIZE"]
 
     merged_controls: List[Dict[str, Any]] = []
@@ -764,7 +1192,7 @@ def extract_controls_cursor(doc_id: str):
     while True:
         instruction = INSTRUCTION_CONTROLS.format(batch_size=batch_size, cursor=cursor)
         try:
-            result = invoke_bedrock_with_retry(system_prompt_controls, instruction)
+            result = invoke_bedrock_with_retry(system_prompt_tables, instruction)
         except Exception as e:
             return jsonify({"ok": False, "error": f"Bedrock error (controls): {e}"}), 500
 
@@ -785,41 +1213,91 @@ def extract_controls_cursor(doc_id: str):
     logger.info("[Extract Vendor Controls] Complete: %d total controls in %d passes", len(merged_controls), passes)
 
     # ===========================================
-    # Phase 2: Extract subservice organization controls (single call)
+    # Phase 3: Extract exceptions (from tables)
     # ===========================================
-    logger.info("[Extract Subservice] Starting subservice controls extraction...")
-    system_prompt_subservice = SYSTEM_SUBSERVICE.replace("{{DOCUMENT_TEXT}}", doc_text)
+    logger.info("[Extract Exceptions] Starting...")
     
     try:
-        subservice_result = invoke_bedrock_with_retry(system_prompt_subservice, INSTRUCTION_SUBSERVICE)
+        exceptions_result = invoke_bedrock_with_retry(system_prompt_tables, INSTRUCTION_EXCEPTIONS)
     except Exception as e:
-        return jsonify({"ok": False, "error": f"Bedrock error (subservice): {e}"}), 500
+        return jsonify({"ok": False, "error": f"Bedrock error (exceptions): {e}"}), 500
 
-    subservice_controls = subservice_result.get("subservice_controls", [])
-    logger.info("[Extract Subservice] Found %d subservice organizations", len(subservice_controls))
+    exceptions = exceptions_result.get("exceptions", [])
+    logger.info("[Extract Exceptions] Found %d exceptions", len(exceptions))
 
     # ===========================================
-    # Phase 3: Extract user entity controls (single call)
+    # Phase 4: Extract subservice organization controls (batched, from tables)
     # ===========================================
-    logger.info("[Extract User Entity] Starting user entity controls extraction...")
-    system_prompt_user_entity = SYSTEM_USER_ENTITY.replace("{{DOCUMENT_TEXT}}", doc_text)
+    logger.info("[Extract Subservice] Starting subservice controls extraction (batched)...")
     
-    try:
-        user_entity_result = invoke_bedrock_with_retry(system_prompt_user_entity, INSTRUCTION_USER_ENTITY)
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"Bedrock error (user entity): {e}"}), 500
+    merged_subservice: List[Dict[str, Any]] = []
+    subservice_cursor = ""
+    subservice_passes = 0
 
-    user_entity_controls = user_entity_result.get("user_entity_controls", [])
-    logger.info("[Extract User Entity] Found %d user entity controls", len(user_entity_controls))
+    while True:
+        instruction = INSTRUCTION_SUBSERVICE.format(batch_size=batch_size, cursor=subservice_cursor)
+        try:
+            subservice_result = invoke_bedrock_with_retry(system_prompt_tables, instruction)
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"Bedrock error (subservice): {e}"}), 500
+
+        controls = subservice_result.get("subservice_controls", [])
+        merged_subservice.extend(controls)
+
+        meta = subservice_result.get("meta", {}) or {}
+        subservice_cursor = meta.get("last_control_id") or ""
+        has_more = bool(meta.get("has_more"))
+
+        subservice_passes += 1
+        logger.info("[Extract Subservice] Pass %d: got %d controls, has_more=%s", subservice_passes, len(controls), has_more)
+
+        if not has_more:
+            break
+        time.sleep(0.2)
+
+    subservice_controls = merged_subservice
+    logger.info("[Extract Subservice] Complete: %d total controls in %d passes", len(subservice_controls), subservice_passes)
 
     # ===========================================
-    # Phase 4: Extract criteria mappings (single call)
+    # Phase 5: Extract user entity controls (batched, from tables)
+    # ===========================================
+    logger.info("[Extract User Entity] Starting user entity controls extraction (batched)...")
+    
+    merged_user_entity: List[Dict[str, Any]] = []
+    user_entity_cursor = ""
+    user_entity_passes = 0
+
+    while True:
+        instruction = INSTRUCTION_USER_ENTITY.format(batch_size=batch_size, cursor=user_entity_cursor)
+        try:
+            user_entity_result = invoke_bedrock_with_retry(system_prompt_tables, instruction)
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"Bedrock error (user entity): {e}"}), 500
+
+        controls = user_entity_result.get("user_entity_controls", [])
+        merged_user_entity.extend(controls)
+
+        meta = user_entity_result.get("meta", {}) or {}
+        user_entity_cursor = meta.get("last_description") or ""
+        has_more = bool(meta.get("has_more"))
+
+        user_entity_passes += 1
+        logger.info("[Extract User Entity] Pass %d: got %d controls, has_more=%s", user_entity_passes, len(controls), has_more)
+
+        if not has_more:
+            break
+        time.sleep(0.2)
+
+    user_entity_controls = merged_user_entity
+    logger.info("[Extract User Entity] Complete: %d total controls in %d passes", len(user_entity_controls), user_entity_passes)
+
+    # ===========================================
+    # Phase 6: Extract criteria mappings (from tables)
     # ===========================================
     logger.info("[Extract Criteria] Starting criteria extraction...")
-    system_prompt_criteria = SYSTEM_CRITERIA.replace("{{DOCUMENT_TEXT}}", doc_text)
     
     try:
-        criteria_result = invoke_bedrock_with_retry(system_prompt_criteria, INSTRUCTION_CRITERIA)
+        criteria_result = invoke_bedrock_with_retry(system_prompt_tables, INSTRUCTION_CRITERIA)
     except Exception as e:
         return jsonify({"ok": False, "error": f"Bedrock error (criteria): {e}"}), 500
 
@@ -827,18 +1305,26 @@ def extract_controls_cursor(doc_id: str):
     logger.info("[Extract Criteria] Found %d criteria", len(criteria_mappings))
 
     # ===========================================
-    # Phase 5: Merge criteria into vendor controls
+    # Phase 7: Merge criteria into vendor controls
     # ===========================================
     final_controls = merge_criteria_into_controls(merged_controls, criteria_mappings)
     logger.info("[Merge] Merged criteria into %d controls", len(final_controls))
 
     # ===========================================
-    # Phase 6: Build DOCX with all control types
+    # Phase 8: Build DOCX with all content
     # ===========================================
     rid = str(uuid.uuid4())[:8]
     docx_path = _report_path_docx(rid)
     try:
-        build_controls_docx(final_controls, subservice_controls, user_entity_controls, docx_path)
+        build_report_docx(
+            auditor_opinion=auditor_opinion,
+            subservice_controls=subservice_controls,
+            user_entity_controls=user_entity_controls,
+            vendor_controls=final_controls,
+            exceptions=exceptions,
+            criteria_mappings=criteria_mappings,
+            out_path=docx_path
+        )
     except Exception as e:
         logger.exception("Failed to build DOCX: %s", e)
 
@@ -849,17 +1335,22 @@ def extract_controls_cursor(doc_id: str):
         "ok": True,
         "result": {
             "extraction": {
+                "auditor_opinion": auditor_opinion,
                 "vendor_controls": final_controls,
+                "exceptions": exceptions,
                 "subservice_controls": subservice_controls,
                 "user_entity_controls": user_entity_controls,
             },
             "criteria_mappings": criteria_mappings,
             "meta": {
                 "vendor_controls_found": len(final_controls),
+                "exceptions_found": len(exceptions),
                 "subservice_controls_found": len(subservice_controls),
                 "user_entity_controls_found": len(user_entity_controls),
                 "criteria_found": len(criteria_mappings),
-                "passes": passes,
+                "vendor_passes": passes,
+                "subservice_passes": subservice_passes,
+                "user_entity_passes": user_entity_passes,
             }
         },
         "report_id": rid if docx_ok else None,
@@ -877,5 +1368,4 @@ def download_docx(rid: str):
 
 
 if __name__ == "__main__":
-
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)

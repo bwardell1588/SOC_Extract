@@ -1,203 +1,278 @@
-# SOC_Extract
-Extract core info from SOC II Reports
-# SOC 2 Control Extractor
+**SOC 2 Extraction App**
 
-A Flask-based application that extracts control information from SOC 2 PDF reports using AWS Bedrock (Claude) and generates structured DOCX reports.
+A Flask app that ingests a SOC 2 PDF, segments narrative vs. tables, runs multi-phase extraction via AWS Bedrock, merges/normalizes the results, and generates a downloadable landscape DOCX report.
 
-## Features
+Frontend: a single HTML page at / with upload → parse → extract → download flow.
 
-- **PDF Parsing**: Extracts text from SOC 2 PDFs using pdfminer with intelligent table/narrative segmentation
-- **Multi-Phase Extraction**: Extracts three types of controls:
-  - Vendor/Service Organization Controls (with tests and results)
-  - Complementary Subservice Organization Controls
-  - Complementary User Entity Controls
-- **Criteria Mapping**: Extracts and merges criteria mappings from both control tables and dedicated mapping sections
-- **Prompt Caching**: Optimized for AWS Bedrock prompt caching to reduce costs on multi-call extractions
-- **DOCX Report Generation**: Produces formatted Word documents with separate tables for each control type
+PDF parsing & sectioning using pdfminer.six, with detection of “SECTION I/II/III…” (roman, numeric, or word) to classify pages as narrative vs. table content.
 
-## Architecture
+Multi-phase Bedrock extraction: auditor opinion, vendor controls, exceptions, subservice controls, user-entity controls, and criteria mappings; includes retries/backoff and cursor-based batching for large reports.
 
-┌─────────────────────────────────────────────────────────────────────┐
-│                         PDF Upload                                   │
-└─────────────────────────────────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Parse & Segment                                   │
-│  • Extract text with pdfminer                                       │
-│  • Identify table pages vs narrative pages                          │
-│  • Cache: full_text, table_text, narrative_text                     │
-└─────────────────────────────────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│              Multi-Phase LLM Extraction (Shared Cache)              │
-│                                                                      │
-│  Phase 1: Vendor Controls (batched, cursor-based)                   │
-│  Phase 2: Subservice Organization Controls (single call)            │
-│  Phase 3: User Entity Controls (single call)                        │
-│  Phase 4: Criteria Mappings (single call)                           │
-│  Phase 5: Merge criteria into vendor controls                       │
-└─────────────────────────────────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    DOCX Report Generation                           │
-│  • Vendor Controls table (ID, Criteria, Title, Desc, Tests, Result) │
-│  • Subservice Controls table (Org, ID, Description, Criteria)       │
-│  • User Entity Controls table (Category, ID, Description, Criteria) │
-└─────────────────────────────────────────────────────────────────────┘
-```
+Criteria ↔ control merge so each control includes mapped TSC criteria without duplication.
 
-**Installation**
+DOCX report builder with sections for general info, criteria mappings, subservice/user-entity controls, vendor controls, and exceptions (landscape layout, narrow margins).
 
-**Prerequisites**
-Python 3.8+
-AWS credentials configured with Bedrock access
+Minimal UI: upload → parse → extract → download link, with status badges and JSON preview.
 
-**Environment Variables**
+**Architecture**
+/app.py
+/prompts.py  # required constants imported by app.py (already provided)
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `BEDROCK_REGION` | `us-east-1` | AWS region for Bedrock |
-| `BEDROCK_MODEL_ID` | `global.anthropic.claude-haiku-4-5-20251001-v1:0` | Claude model ID |
-| `READ_TIMEOUT` | `120` | Bedrock read timeout (seconds) |
-| `CONNECT_TIMEOUT` | `15` | Bedrock connect timeout (seconds) |
-| `MAX_TOTAL_TOKENS` | `10000` | Max tokens for LLM response |
-| `TEMPERATURE` | `0.0` | LLM temperature |
-| `BATCH_SIZE` | `20` | Controls per extraction batch |
-| `MAX_RETRIES` | `3` | Bedrock retry attempts |
-| `REPORT_DIR` | `./generated_reports` | Directory for DOCX output |
-| `LOG_BEDROCK_FULL` | `1` | Log full Bedrock responses |
-| `LOG_BEDROCK_MAX_CHARS` | `0` | Truncate logs (0 = no limit) |
-| `AWS_ACCESS_KEY` | - | Optional AWS access key |
-| `AWS_SECRET` | - | Optional AWS secret key |
+**High-level flow:**
+/parse — Reads PDF, extracts text per page, detects section markers, builds two blobs:
 
-**Usage:**
+table_text (Section III+ → tables/controls)
 
-**Start the Server**
+narrative_text (Sections 0–II → cover, TOC, opinion/management)
+Results are cached in-memory under a doc_id.
 
-```bash
+/extract_cursor/<doc_id> — Orchestrates multiple phases against Bedrock:
+Auditor opinion → vendor controls (cursor+batching) → exceptions → subservice controls (cursor+batching) → user-entity controls (cursor+batching) → criteria mappings → merge criteria into controls → build DOCX & return a report_id.
+
+/download/docx/<report_id> — Streams the generated report.
+
+**Internals:**
+
+invoke_bedrock_with_retry wraps Bedrock calls with exponential backoff and optional logging truncation.
+
+In-memory PARSED_CACHE stores full_text, table_text, narrative_text, and pages for the active doc_id.
+
+**Requirements**
+
+Python 3.10+ (recommended)
+AWS credentials with permission to call Bedrock Runtime
+System deps for pdfminer.six and python-docx (for report generation)
+
+**Python packages**
+flask
+boto3
+botocore
+pdfminer.six
+python-docx
+
+python-docx is required for DOCX generation.
+
+**Configuration**
+All config via environment variables:
+
+**Variable	Default	Notes**
+BEDROCK_REGION	
+BEDROCK_MODEL_ID	
+READ_TIMEOUT	120	Bedrock client read timeout (s).
+CONNECT_TIMEOUT	15	Bedrock client connect timeout (s).
+MAX_TOTAL_TOKENS	10000	Token cap for Bedrock calls.
+TEMPERATURE	0.0	Deterministic output.
+REPORT_DIR	
+BATCH_SIZE	20	Controls per extraction pass (cursor batching).
+MAX_RETRIES	3	Retries for Bedrock calls.
+LOG_BEDROCK_FULL	1	If truthy, logs full Bedrock JSON (consider redaction).
+LOG_BEDROCK_MAX_CHARS	0	If >0, truncates logged JSON to this many chars.
+AWS_ACCESS_KEY, AWS_SECRET
+
+Example .env:
+
+BEDROCK_REGION=
+BEDROCK_MODEL_ID=
+MAX_TOTAL_TOKENS=10000
+TEMPERATURE=0.0
+BATCH_SIZE=20
+MAX_RETRIES=3
+LOG_BEDROCK_FULL=0
+REPORT_DIR=
+AWS_ACCESS_KEY=...
+AWS_SECRET=...
+
+Running Locally
+python -m venv .venv
+. .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+export FLASK_ENV=development
+export PORT=5000
 python app.py
-```
 
-The server starts on `http://localhost:5000` by default.
 
-**Web Interface**
+Visit: http://localhost:5000/
 
-1. Open `http://localhost:5000` in your browser
-2. Upload a SOC 2 PDF file
-3. Click "Run Extraction"
-4. Download the generated DOCX report
+Endpoints
+GET /
 
-**Data Schemas:**
+Returns a minimal HTML UI to upload a SOC 2 PDF and kick off extraction.
 
-**Vendor Control**
-```json
+POST /parse
+
+Body: multipart/form-data with pdf file.
+Response (JSON):
+
 {
-  "control_id": "1.1",
-  "criterion": ["CC1.1", "CC1.2"],
-  "control_title": "Board Oversight",
-  "control_description": "The board of directors meets quarterly...",
-  "tests_applied": ["Inspected board meeting minutes", "Inquired of management"],
-  "result": "No exceptions noted"
+  "ok": true,
+  "doc_id": "abcd1234",
+  "total_pages": 72,
+  "table_pages": 41,
+  "narrative_pages": 31,
+  "full_chars": 123456,
+  "table_chars": 98765
 }
-```
 
-**Subservice Organization Control**
-```json
+
+On error: {"ok": false, "error": "..."} with 4xx/5xx.
+
+POST /extract_cursor/<doc_id>
+
+Runs the full multi-phase extraction and builds the DOCX.
+Response (JSON, abbreviated):
+
 {
-  "name": "Amazon Web Services",
-  "controls": [
-    {
-      "control_id": "1",
-      "description": "AWS provides physical security controls...",
-      "criteria_covered": ["CC6.1", "CC6.2"]
+  "ok": true,
+  "result": {
+    "extraction": {
+      "auditor_opinion": { "...": "..." },
+      "vendor_controls": [
+        {
+          "control_id": "C-001",
+          "criterion": ["CC1.1"],
+          "control_title": "",
+          "control_description": "",
+          "tests_applied": ["", ""],
+          "result": "No exceptions noted"
+        }
+      ],
+      "exceptions": [ { "control_objective": "...", "...": "..." } ],
+      "subservice_controls": [ ... ],
+      "user_entity_controls": [ ... ]
+    },
+    "criteria_mappings": [
+      { "criterion_id": "CC1.1", "description": "...", "mapped_controls": ["C-001","C-002"] }
+    ],
+    "meta": {
+      "vendor_controls_found": 120,
+      "exceptions_found": 1,
+      "subservice_controls_found": 8,
+      "user_entity_controls_found": 10,
+      "criteria_found": 15,
+      "vendor_passes": 7,
+      "subservice_passes": 2,
+      "user_entity_passes": 2
     }
-  ]
+  },
+  "report_id": "efgh5678",
+  "elapsed_sec": 42.13,
+  "passes": 7
 }
-```
 
-**User Entity Control**
-```json
-{
-  "name": "User Entity Controls",
-  "controls": [
-    {
-      "control_id": "1",
-      "description": "Users are responsible for maintaining strong passwords...",
-      "criteria_covered": ["CC6.1"]
-    }
-  ]
-}
-```
 
-**Criteria Mapping**
-```json
-{
-  "criterion_id": "CC6.1",
-  "criterion_description": "The entity implements logical access security...",
-  "mapped_controls": ["6.1", "6.2", "6.3", "6.4", "6.5"]
-}
-```
+On error: {"ok": false, "error": "Bedrock error (...)"}.
 
-**Table Detection**
+GET /download/docx/<report_id>
 
-The app intelligently segments PDF pages into table content vs narrative content to reduce LLM context size. Table pages are identified by:
+Downloads the generated Word document soc2_report_<report_id>.docx.
 
-**Positive Indicators:**
-- Control reference patterns (e.g., `1.1`, `6.15`) combined with result phrases
-- Table column headers ("Controls Specified", "Testing Performed", "Results of Testing")
-- Criteria references (`CC1.1`, `CC6.2`)
-- Dense testing language ("inspected", "inquired", "determined", "no exceptions noted")
-- "(continued)" markers
+**CLI Examples**
 
-**Negative Indicators:**
-- Long prose paragraphs (>500 chars)
-- Narrative section headers ("Overview of Operations", "Management's Assertion")
+Parse:
 
-Pages directly before detected table pages are automatically included to capture table headers.
+curl -F "pdf=@/path/to/report.pdf" http://localhost:5000/parse
 
-## Prompt Caching
 
-The app is optimized for AWS Bedrock's prompt caching feature:
+Extract + build report:
 
-- A single system prompt containing the document text is created once
-- All extraction phases (vendor controls, subservice, user entity, criteria) reuse this cached prompt
-- Only the first call creates the cache; subsequent calls read from cache at reduced cost
+curl -X POST http://localhost:5000/extract_cursor/<doc_id>
 
-**Expected token usage:**
-```
-Call 1: cache_creation_input_tokens: ~26000, cache_read_input_tokens: 0
-Call 2+: cache_creation_input_tokens: 0, cache_read_input_tokens: ~26000
-```
 
-**File Structure**
+**Download report:**
 
-```
-├── app.py              # Main Flask application
-├── prompts.py          # LLM prompt templates
-└── README.md           # This file
-```
+curl -L -o soc2_report.docx http://localhost:5000/download/docx/<report_id>
+
+Page Classification Logic
+
+Sections 0, I, II → narrative (cover, TOC, auditor/management).
+
+Sections III+ → table content (system description, controls, testing).
+
+Fallback heuristics (e.g., “no exceptions noted”, CC1.1 patterns, multi-column lines) apply when section detection is ambiguous.
+
+**Report Layout (DOCX)**
+
+General Information (service/product, report type, scope date, auditor, qualified opinion, opinion text)
+
+Criteria Mappings (criterion → description → mapped controls)
+
+Complementary Subservice Organization Controls
+
+Complementary User Entity Controls
+
+Vendor/Service Organization Controls (ID, criteria, title, description, tests, result)
+
+Exceptions (objective, testing, exception, management response)
+
+Formatting: landscape, ~0.5″ margins, compact tables, minimal borders.
+
+**Tuning & Logging**
+
+Batching: BATCH_SIZE controls rows per Bedrock pass.
+
+Retries: MAX_RETRIES with exponential backoff.
+
+Logging: enable LOG_BEDROCK_FULL=1 for full response logs; limit with LOG_BEDROCK_MAX_CHARS. Be mindful of sensitive content.
+
+**Security & Privacy**
+
+PDFs are held in memory during parsing and cached in-process (PARSED_CACHE) keyed by doc_id.
+
+DOCX files are written to REPORT_DIR (or a temp fallback) and served via /download/docx/<rid>.
+
+Bedrock payloads may include document text; consider disabling full logging in production and restricting access to the app.
 
 **Troubleshooting**
 
-Extraction loops indefinitely
-The LLM may not be setting `has_more: false` correctly. Check:
-- Prompt clarity about when to stop
-- Whether the document structure matches expected patterns
-- Bedrock logs for the actual responses
+Import error: prompts → Ensure prompts.py exists with the required constants (see below).
 
-Missing criteria
-Criteria can come from two sources:
-1. Directly from control tables (column or header)
-2. From dedicated mapping tables (Section V)
+DOCX generation error → Install python-docx.
 
-The app merges both without duplicates. Check logs for:
-[Merge] X controls had criteria from extraction, Y had criteria added from mapping
+Empty/partial extraction → Increase MAX_TOTAL_TOKENS, reduce BATCH_SIZE, and verify your prompts’ {batch_size} / {cursor} placeholders.
+
+Bedrock connectivity → Check AWS creds/region; the app supports explicit AWS_ACCESS_KEY/AWS_SECRET or default Boto3 providers.
+
+Windows report path → Override REPORT_DIR on Linux/macOS; the app will fall back to a temp dir if creation fails.
+
+API Contract (Prompts → Expected JSON)
+
+Model responses are parsed from text into JSON. Prompts must return strict JSON (no code fences). Example shapes:
+
+Auditor opinion
+
+{
+  "auditor_opinion": {
+    "service_product": "",
+    "report_type": "SOC 2 Type 2",
+    "scope_date": "01/01/2024 - 12/31/2024",
+    "auditors_opinion": "",
+    "auditors_name": "",
+    "qualified_opinion": false
+  }
+}
 
 
-PDF parsing issues
-Some PDFs may not extract cleanly with pdfminer. Try:
-- Ensuring the PDF is text-based (not scanned images)
-- Checking the test_parser.py output for extraction quality
+Vendor controls (batched with cursor)
+
+{
+  "extraction": {
+    "controls": [
+      {
+        "control_id": "1.1",
+        "criterion": ["CC6.1", "CC6.2"],
+        "control_title": "",
+        "control_description": "",
+        "tests_applied": [""],
+        "result": "No exceptions noted"
+      }
+    ]
+  },
+  "meta": { "has_more": true, "last_control_id": "1.1" }
+}
+
+Similar shapes are expected for subservice/user-entity controls, criteria mappings, and exceptions.
+
+**Maintainers**
+Primary: @brian.wardell
+Logging prefix: soc2 (via logging.getLogger("soc2"))

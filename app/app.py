@@ -40,15 +40,15 @@ logger = logging.getLogger("soc2")
 
 app = Flask(__name__)
 
-DEFAULT_REPORT_DIR = r"your directory"
+DEFAULT_REPORT_DIR = r"C:\Users\brian.wardell\AI_Projects\soc_extract\app\generated_reports"
 
 
 @dataclass
 class AppConfig:
-    BEDROCK_REGION: str = os.getenv("BEDROCK_REGION", "your region")
+    BEDROCK_REGION: str = os.getenv("BEDROCK_REGION", "us-east-1")
     BEDROCK_MODEL_ID: str = os.getenv(
         "BEDROCK_MODEL_ID",
-        "your model"
+        "global.anthropic.claude-haiku-4-5-20251001-v1:0"
     )
     READ_TIMEOUT: int = int(os.getenv("READ_TIMEOUT", "120"))
     CONNECT_TIMEOUT: int = int(os.getenv("CONNECT_TIMEOUT", "15"))
@@ -81,8 +81,28 @@ def _resolve_report_dir() -> str:
     return base
 
 
-def _report_path_docx(report_id: str) -> str:
+def _sanitize_filename(name: str) -> str:
+    """Sanitize a string for use in a filename."""
+    # Remove or replace invalid characters
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        name = name.replace(char, '_')
+    # Limit length and strip whitespace
+    return name.strip()[:100]
+
+
+def _report_path_docx(report_id: str, service_product: str = None) -> str:
+    if service_product:
+        safe_name = _sanitize_filename(service_product)
+        return os.path.join(_resolve_report_dir(), f"{safe_name} SOC Analysis.docx")
     return os.path.join(_resolve_report_dir(), f"soc2_report_{report_id}.docx")
+
+
+def _report_path_json(report_id: str, service_product: str = None) -> str:
+    if service_product:
+        safe_name = _sanitize_filename(service_product)
+        return os.path.join(_resolve_report_dir(), f"{safe_name} Output.json")
+    return os.path.join(_resolve_report_dir(), f"soc2_output_{report_id}.json")
 
 
 # Cache: doc_id -> {full_text, table_text, narrative_text}
@@ -721,7 +741,9 @@ def build_report_docx(
     section.top_margin = section.bottom_margin = Inches(0.5)
     section.left_margin = section.right_margin = Inches(0.5)
 
-    doc.add_heading("SOC 2 Report Extraction", 0)
+    # Dynamic title based on service/product name
+    service_product = auditor_opinion.get("service_product") or "SOC 2"
+    doc.add_heading(f"{service_product} SOC Analysis", 0)
 
     # ===========================================
     # Section 1: General Info Table (no borders)
@@ -968,6 +990,14 @@ INDEX_HTML = r'''
         </form>
       </div>
 
+      <div class="row" style="margin-top: 16px;">
+        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+          <input type="checkbox" id="exceptionsOnly" style="width: 18px; height: 18px;" />
+          <span>Exceptions Only</span>
+          <span class="muted" style="font-size: 12px;">(Extract only vendor controls with exceptions)</span>
+        </label>
+      </div>
+
       <div class="row badges">
         <div id="badgeParsed" class="badge off">Parsed</div>
         <div id="badgeExtracting" class="badge off">Extracting…</div>
@@ -1024,7 +1054,9 @@ INDEX_HTML = r'''
           setBadge(badges.extracting, 'on');
           statusText.textContent = 'Extracting controls...';
 
-          const extractResp = await fetch('/extract_cursor/' + parseData.doc_id, { method: 'POST' });
+          const exceptionsOnly = document.getElementById('exceptionsOnly').checked;
+          const extractUrl = '/extract_cursor/' + parseData.doc_id + (exceptionsOnly ? '?exceptions_only=1' : '');
+          const extractResp = await fetch(extractUrl, { method: 'POST' });
           const extractData = await extractResp.json();
           if (!extractData.ok) {
             setBadge(badges.extracting, 'err');
@@ -1041,11 +1073,21 @@ INDEX_HTML = r'''
           resultDiv.appendChild(pre);
 
           if (extractData.report_id) {
-            const link = document.createElement('a');
-            link.href = '/download/docx/' + extractData.report_id;
-            link.textContent = 'Download DOCX Report';
-            link.className = 'download';
-            resultDiv.appendChild(link);
+            const serviceProduct = encodeURIComponent(extractData.service_product || '');
+            
+            // DOCX download link
+            const docxLink = document.createElement('a');
+            docxLink.href = '/download/docx/' + extractData.report_id + '?service_product=' + serviceProduct;
+            docxLink.textContent = 'Download DOCX Report';
+            docxLink.className = 'download';
+            resultDiv.appendChild(docxLink);
+            
+            // JSON download link
+            const jsonLink = document.createElement('a');
+            jsonLink.href = '/download/json/' + extractData.report_id + '?service_product=' + serviceProduct;
+            jsonLink.textContent = 'Download JSON Output';
+            jsonLink.className = 'download';
+            resultDiv.appendChild(jsonLink);
           }
         } catch (err) {
           setBadge(badges.extracting, 'err');
@@ -1073,6 +1115,7 @@ from prompts import (
     SYSTEM_DOCUMENT_TABLES,
     SYSTEM_DOCUMENT_GENERAL,
     INSTRUCTION_CONTROLS,
+    INSTRUCTION_CONTROLS_EXCEPTIONS_ONLY,
     INSTRUCTION_SUBSERVICE,
     INSTRUCTION_USER_ENTITY,
     INSTRUCTION_CRITERIA,
@@ -1135,15 +1178,21 @@ def extract_controls_cursor(doc_id: str):
     1. Extract auditor's opinion (from first 25 pages, no caching)
     2. Extract vendor/service organization controls (batched, cursor-based, cached)
     3. Extract exceptions (single call, cached)
-    4. Extract subservice organization controls (single call, cached)
-    5. Extract user entity controls (single call, cached)
+    4. Extract subservice organization controls (batched, cursor-based, cached)
+    5. Extract user entity controls (batched, cursor-based, cached)
     6. Extract criteria mappings (single call, cached)
     7. Merge criteria into vendor controls
     8. Generate DOCX with all content
+    
+    Query params:
+    - exceptions_only: If "1" or "true", only extract vendor controls with exceptions
     """
     if doc_id not in PARSED_CACHE:
         return jsonify({"ok": False, "error": "Unknown doc_id"}), 404
 
+    # Check for exceptions_only parameter
+    exceptions_only = request.args.get("exceptions_only", "").lower() in ("1", "true")
+    
     cache = PARSED_CACHE[doc_id]
 
     # Get text segments
@@ -1154,8 +1203,8 @@ def extract_controls_cursor(doc_id: str):
     first_pages = pages[:25]
     first_pages_text = "\n".join([f"=== PAGE {i+1} ===\n{p}" for i, p in enumerate(first_pages)])
     
-    logger.info("[Extract] Using first %d pages (%d chars) for auditor opinion, table_text (%d chars) for controls", 
-                len(first_pages), len(first_pages_text), len(table_text))
+    logger.info("[Extract] Using first %d pages (%d chars) for auditor opinion, table_text (%d chars) for controls. exceptions_only=%s", 
+                len(first_pages), len(first_pages_text), len(table_text), exceptions_only)
 
     t0 = time.time()
 
@@ -1184,13 +1233,16 @@ def extract_controls_cursor(doc_id: str):
     # Phase 2: Extract vendor controls (batched, from tables)
     # ===========================================
     batch_size = app.config["BATCH_SIZE"]
+    
+    # Select the appropriate instruction based on exceptions_only flag
+    controls_instruction = INSTRUCTION_CONTROLS_EXCEPTIONS_ONLY if exceptions_only else INSTRUCTION_CONTROLS
 
     merged_controls: List[Dict[str, Any]] = []
     cursor = ""
     passes = 0
 
     while True:
-        instruction = INSTRUCTION_CONTROLS.format(batch_size=batch_size, cursor=cursor)
+        instruction = controls_instruction.format(batch_size=batch_size, cursor=cursor)
         try:
             result = invoke_bedrock_with_retry(system_prompt_tables, instruction)
         except Exception as e:
@@ -1204,7 +1256,8 @@ def extract_controls_cursor(doc_id: str):
         has_more = bool(meta.get("has_more"))
 
         passes += 1
-        logger.info("[Extract Vendor Controls] Pass %d: got %d controls, has_more=%s", passes, len(controls), has_more)
+        logger.info("[Extract Vendor Controls] Pass %d: got %d controls, has_more=%s (exceptions_only=%s)", 
+                    passes, len(controls), has_more, exceptions_only)
 
         if not has_more:
             break
@@ -1231,11 +1284,21 @@ def extract_controls_cursor(doc_id: str):
     logger.info("[Extract Subservice] Starting subservice controls extraction (batched)...")
     
     merged_subservice: List[Dict[str, Any]] = []
-    subservice_cursor = ""
+    subservice_last_control: Dict[str, Any] = {}
     subservice_passes = 0
 
     while True:
-        instruction = INSTRUCTION_SUBSERVICE.format(batch_size=batch_size, cursor=subservice_cursor)
+        # Build cursor instruction based on last control
+        if subservice_last_control:
+            cursor_instruction = f"""Start AFTER the control with:
+- Organization: {subservice_last_control.get('organization_name', '')}
+- Control ID: {subservice_last_control.get('control_id', '')}
+- Description starting with: {subservice_last_control.get('description_start', '')}
+- Criteria: {', '.join(subservice_last_control.get('criteria_covered', []))}"""
+        else:
+            cursor_instruction = "Start from the beginning."
+        
+        instruction = INSTRUCTION_SUBSERVICE.format(batch_size=batch_size, cursor_instruction=cursor_instruction)
         try:
             subservice_result = invoke_bedrock_with_retry(system_prompt_tables, instruction)
         except Exception as e:
@@ -1245,7 +1308,7 @@ def extract_controls_cursor(doc_id: str):
         merged_subservice.extend(controls)
 
         meta = subservice_result.get("meta", {}) or {}
-        subservice_cursor = meta.get("last_control_id") or ""
+        subservice_last_control = meta.get("last_control") or {}
         has_more = bool(meta.get("has_more"))
 
         subservice_passes += 1
@@ -1264,11 +1327,21 @@ def extract_controls_cursor(doc_id: str):
     logger.info("[Extract User Entity] Starting user entity controls extraction (batched)...")
     
     merged_user_entity: List[Dict[str, Any]] = []
-    user_entity_cursor = ""
+    user_entity_last_control: Dict[str, Any] = {}
     user_entity_passes = 0
 
     while True:
-        instruction = INSTRUCTION_USER_ENTITY.format(batch_size=batch_size, cursor=user_entity_cursor)
+        # Build cursor instruction based on last control
+        if user_entity_last_control:
+            cursor_instruction = f"""Start AFTER the control with:
+- Category: {user_entity_last_control.get('category', '')}
+- Control ID: {user_entity_last_control.get('control_id', '')}
+- Description starting with: {user_entity_last_control.get('description_start', '')}
+- Criteria: {', '.join(user_entity_last_control.get('criteria_covered', []))}"""
+        else:
+            cursor_instruction = "Start from the beginning."
+        
+        instruction = INSTRUCTION_USER_ENTITY.format(batch_size=batch_size, cursor_instruction=cursor_instruction)
         try:
             user_entity_result = invoke_bedrock_with_retry(system_prompt_tables, instruction)
         except Exception as e:
@@ -1278,7 +1351,7 @@ def extract_controls_cursor(doc_id: str):
         merged_user_entity.extend(controls)
 
         meta = user_entity_result.get("meta", {}) or {}
-        user_entity_cursor = meta.get("last_description") or ""
+        user_entity_last_control = meta.get("last_control") or {}
         has_more = bool(meta.get("has_more"))
 
         user_entity_passes += 1
@@ -1311,10 +1384,47 @@ def extract_controls_cursor(doc_id: str):
     logger.info("[Merge] Merged criteria into %d controls", len(final_controls))
 
     # ===========================================
-    # Phase 8: Build DOCX with all content
+    # Phase 8: Build output files (DOCX and JSON)
     # ===========================================
     rid = str(uuid.uuid4())[:8]
-    docx_path = _report_path_docx(rid)
+    service_product = auditor_opinion.get("service_product") or ""
+    
+    # Build the output data structure
+    output_data = {
+        "extraction": {
+            "auditor_opinion": auditor_opinion,
+            "vendor_controls": final_controls,
+            "exceptions": exceptions,
+            "subservice_controls": subservice_controls,
+            "user_entity_controls": user_entity_controls,
+        },
+        "criteria_mappings": criteria_mappings,
+        "meta": {
+            "vendor_controls_found": len(final_controls),
+            "exceptions_found": len(exceptions),
+            "subservice_controls_found": len(subservice_controls),
+            "user_entity_controls_found": len(user_entity_controls),
+            "criteria_found": len(criteria_mappings),
+            "vendor_passes": passes,
+            "subservice_passes": subservice_passes,
+            "user_entity_passes": user_entity_passes,
+            "exceptions_only": exceptions_only,
+        }
+    }
+    
+    # Save JSON output file
+    json_path = _report_path_json(rid, service_product)
+    try:
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, indent=2, ensure_ascii=False)
+        logger.info("[Output] Saved JSON: %s", json_path)
+    except Exception as e:
+        logger.exception("Failed to save JSON: %s", e)
+    
+    json_ok = os.path.exists(json_path)
+    
+    # Build DOCX report
+    docx_path = _report_path_docx(rid, service_product)
     try:
         build_report_docx(
             auditor_opinion=auditor_opinion,
@@ -1333,27 +1443,11 @@ def extract_controls_cursor(doc_id: str):
 
     return jsonify({
         "ok": True,
-        "result": {
-            "extraction": {
-                "auditor_opinion": auditor_opinion,
-                "vendor_controls": final_controls,
-                "exceptions": exceptions,
-                "subservice_controls": subservice_controls,
-                "user_entity_controls": user_entity_controls,
-            },
-            "criteria_mappings": criteria_mappings,
-            "meta": {
-                "vendor_controls_found": len(final_controls),
-                "exceptions_found": len(exceptions),
-                "subservice_controls_found": len(subservice_controls),
-                "user_entity_controls_found": len(user_entity_controls),
-                "criteria_found": len(criteria_mappings),
-                "vendor_passes": passes,
-                "subservice_passes": subservice_passes,
-                "user_entity_passes": user_entity_passes,
-            }
-        },
+        "result": output_data,
         "report_id": rid if docx_ok else None,
+        "json_saved": json_ok,
+        "docx_saved": docx_ok,
+        "service_product": service_product,
         "elapsed_sec": elapsed,
         "passes": passes,
     })
@@ -1361,13 +1455,40 @@ def extract_controls_cursor(doc_id: str):
 
 @app.get("/download/docx/<rid>")
 def download_docx(rid: str):
-    docx_path = _report_path_docx(rid)
+    service_product = request.args.get("service_product", "")
+    docx_path = _report_path_docx(rid, service_product if service_product else None)
     if not os.path.exists(docx_path):
-        return jsonify({"ok": False, "error": "DOCX not found"}), 404
-    return send_file(docx_path, as_attachment=True, download_name=f"soc2_report_{rid}.docx")
+        # Fallback to old naming convention
+        docx_path = _report_path_docx(rid)
+        if not os.path.exists(docx_path):
+            return jsonify({"ok": False, "error": "DOCX not found"}), 404
+    
+    if service_product:
+        download_name = f"{_sanitize_filename(service_product)} SOC Analysis.docx"
+    else:
+        download_name = f"soc2_report_{rid}.docx"
+    return send_file(docx_path, as_attachment=True, download_name=download_name)
+
+
+@app.get("/download/json/<rid>")
+def download_json(rid: str):
+    service_product = request.args.get("service_product", "")
+    json_path = _report_path_json(rid, service_product if service_product else None)
+    if not os.path.exists(json_path):
+        # Fallback to old naming convention
+        json_path = _report_path_json(rid)
+        if not os.path.exists(json_path):
+            return jsonify({"ok": False, "error": "JSON not found"}), 404
+    
+    if service_product:
+        download_name = f"{_sanitize_filename(service_product)} Output.json"
+    else:
+        download_name = f"soc2_output_{rid}.json"
+    return send_file(json_path, as_attachment=True, download_name=download_name)
 
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)
+
 
 
